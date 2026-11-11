@@ -29,6 +29,7 @@ function layout({ title, siteName, user, csrf, body, headExtra = '' }) {
         '<a href="/hubs">Hubs</a>',
         '<a href="/subscriptions">Subscriptions</a>',
         user.hub_slug ? `<a href="/u/${encodeURIComponent(user.hub_slug)}">My hub</a>` : '<a href="/onboarding">Create hub</a>',
+        '<a href="/me">Account</a>',
         '<a href="/photos">Photos</a>',
         '<a href="/writings">Writings</a>'
       );
@@ -46,6 +47,7 @@ function layout({ title, siteName, user, csrf, body, headExtra = '' }) {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${esc(title)} · ${esc(siteName)}</title>
 <link rel="stylesheet" href="/style.css">
+<link rel="stylesheet" href="/theme.css">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 ${headExtra}
 </head>
@@ -57,7 +59,7 @@ ${headExtra}
 <main class="main">
 ${body}
 </main>
-<footer class="footer">${esc(siteName)} — hubs are public, feeds are members only</footer>
+<footer class="footer">${esc(siteName)} · <a href="/privacy">Privacy</a> · public hubs &amp; RSS, members-only feeds</footer>
 </body>
 </html>`;
 }
@@ -83,7 +85,46 @@ export function landingPage(ctx, providers, error) {
   ${err}
   <div class="btnrow">${buttons}</div>
   ${disabledNote}
-  <p class="muted" style="margin-top:2rem"><a href="/hubs">Browse public hubs →</a></p>
+  <p class="muted" style="margin-top:2rem"><a href="/hubs">Browse public hubs →</a> · <a href="/privacy">Privacy</a></p>
+</section>`);
+}
+
+export function privacyPage(ctx) {
+  return page(ctx, 'Privacy', `
+<section class="card">
+  <h1>Privacy</h1>
+  <p><strong>What we collect.</strong> Only what the sign-in provider (Instagram or Substack) returns at login:
+  a provider ID and handle, plus name/email/avatar if the provider grants them. We never see or store a password —
+  there are none. We store your hub profile, link tree, posts, likes, follows, feed settings and a hashed session token.</p>
+  <p><strong>What we never do.</strong> No analytics, no ads, no trackers, no third-party scripts or fonts, no CDN calls.
+  The only outbound requests are to the OAuth provider during login. IP addresses are used in-memory for rate limiting
+  only and are never written to disk or logs. Outbound links on hubs use <code>rel="noopener noreferrer"</code>.</p>
+  <p><strong>What is public.</strong> Hub pages marked public (and their RSS feeds), plus the hub directory and global RSS.
+  Everything else — your feed, subscriptions, the gallery, the admin panel — requires an approved member session.
+  You can flip a hub to members-only at any time in <a href="/hub/edit">hub settings</a>.</p>
+  <p><strong>Your controls.</strong> In <a href="/me">Account</a> you can export everything we hold about you as JSON,
+  or delete your account entirely (all your data is removed). Sessions expire after ${'30'} days and can be ended
+  any time by signing out.</p>
+  <p><strong>Retention.</strong> OAuth handshake states are single-use and expire after 10 minutes. Deleted accounts are
+  removed immediately, including posts, links, likes and follows.</p>
+</section>`);
+}
+
+export function mePage({ stats, ...ctx }) {
+  const u = ctx.user;
+  return page(ctx, 'Account', `
+<section class="card">
+  <h1>Your account</h1>
+  <p>@${esc(u.handle || u.sub)} · provider: ${esc(u.provider)} · status: <span class="badge ${esc(u.status)}">${esc(u.status)}</span>${u.role === 'owner' ? ' <span class="badge owner">owner</span>' : ''}</p>
+  ${u.hub_slug ? `<p>Hub: <a href="/u/${encodeURIComponent(u.hub_slug)}">@${esc(u.hub_slug)}</a> (${u.hub_public ? 'public' : 'members-only'}) — <a href="/hub/edit">edit</a></p>` : '<p>No hub yet — <a href="/onboarding">create one</a>.</p>'}
+  <p class="muted">${stats.posts} post(s) · ${stats.links} link(s) · ${stats.following} following · ${stats.followers} follower(s)</p>
+  <p><a class="btn" href="/me/export">Export my data (JSON)</a></p>
+  ${u.role !== 'owner' ? `
+  <form method="post" action="/me/delete" class="form" style="max-width:420px">
+    <input type="hidden" name="csrf" value="${esc(ctx.csrf)}">
+    <p class="error">Deleting your account permanently removes your hub, links, posts, likes, follows and sessions.</p>
+    <button class="small danger" type="submit">Delete my account</button>
+  </form>` : '<p class="muted">The owner account cannot be deleted from here.</p>'}
 </section>`);
 }
 
@@ -173,7 +214,7 @@ export function hubPage({ hub, posts, links, following, canInteract, ...ctx }) {
 <section class="card hub">
   ${hub.avatar ? `<img class="avatar" src="${esc(hub.avatar)}" alt="">` : ''}
   <h1>${esc(hub.name || hub.handle || hub.hub_slug)}</h1>
-  <p class="muted">@${esc(hub.hub_slug)} · <a href="${esc(rssHref)}">RSS feed</a> · ${ctx.followers ?? 0} subscriber(s)</p>
+  <p class="muted">@${esc(hub.hub_slug)}${hub.hub_public ? '' : ' · <span class="badge">members-only</span>'} · <a href="${esc(rssHref)}">RSS feed</a> · ${ctx.followers ?? 0} subscriber(s)</p>
   ${hub.bio ? `<p>${esc(hub.bio)}</p>` : ''}
   ${subBtn}
   ${linkTree}
@@ -224,6 +265,7 @@ ${flashHtml}${errHtml}
     <label>Display name <input type="text" name="name" maxlength="80" value="${esc(u.name)}"></label>
     <label>Bio <textarea name="bio" rows="3" maxlength="300">${esc(u.bio)}</textarea></label>
     <label>Avatar URL (optional, http/https) <input type="text" name="avatar" maxlength="500" value="${esc(u.avatar)}"></label>
+    <label class="check"><input type="checkbox" name="hub_public" value="1" ${u.hub_public ? 'checked' : ''}> Public hub (uncheck for members-only)</label>
     <button type="submit">Save</button>
   </form>
 </section>
@@ -390,9 +432,27 @@ export function adminPage(ctx) {
       </div>`).join('')}</div>`
     : '<p class="muted">No photos yet.</p>';
 
+  const site = ctx.site;
   return page(ctx, 'Admin', `
 <h1>Admin</h1>
 ${flash}
+<section class="card">
+  <h2>Site settings (no code needed)</h2>
+  <form method="post" action="/admin/site" class="form">
+    <input type="hidden" name="csrf" value="${esc(csrf)}">
+    <label>Site name <input type="text" name="site_name" maxlength="80" value="${esc(site.name)}"></label>
+    <label>Tagline <input type="text" name="site_tagline" maxlength="200" value="${esc(site.tagline)}"></label>
+    <label>Accent color <input type="color" name="accent_color" value="${esc(site.accent)}"></label>
+    <label>Theme
+      <select name="theme">
+        <option value="dark" ${site.theme === 'dark' ? 'selected' : ''}>Dark</option>
+        <option value="light" ${site.theme === 'light' ? 'selected' : ''}>Light</option>
+      </select>
+    </label>
+    <button type="submit">Save site settings</button>
+  </form>
+  <p class="muted">OAuth secrets stay in <code>.env</code> — everything else is editable here.</p>
+</section>
 <p class="muted">${ctx.counts.members} approved member(s) · ${ctx.counts.photos} photo(s) · ${ctx.counts.writings} writing(s)</p>
 
 <section class="card">
