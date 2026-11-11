@@ -31,8 +31,23 @@ const IMAGE_TYPES = {
 const RESERVED_SLUGS = new Set([
   'admin', 'u', 'feed', 'rss', 'login', 'logout', 'auth', 'media', 'photos', 'writings',
   'home', 'gate', 'onboarding', 'hub', 'hubs', 'subscriptions', 'posts', 'healthz',
-  'style.css', 'favicon.svg', 'app.js', 'settings',
+  'style.css', 'theme.css', 'favicon.svg', 'app.js', 'settings', 'privacy', 'me',
 ]);
+
+const DEFAULT_ACCENT = '#e8c07d';
+
+const LIGHT_PALETTE = `:root {
+  --bg: #f6f5f2;
+  --panel: #ffffff;
+  --panel-2: #efede8;
+  --text: #1d1c22;
+  --muted: #6b6878;
+  --line: #ddd9d0;
+}`;
+
+function validAccent(s) {
+  return /^#[0-9a-fA-F]{6}$/.test(String(s || '').trim());
+}
 
 function sniffImage(buf) {
   if (buf.length > 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return '.jpg';
@@ -149,13 +164,34 @@ export async function startServer(overrides = {}) {
     return { token, user: row };
   }
 
-  const viewCtx = (req, session) => ({
-    siteName: config.siteName,
-    siteTagline: config.siteTagline,
-    publicUrl: config.publicUrl,
-    user: session?.user ?? null,
-    csrf: session ? csrfFor(config.authSecret, session.token) : '',
-  });
+  function siteSettings() {
+    const s = {};
+    for (const row of store.listSiteSettings()) s[row.key] = row.value;
+    return {
+      name: s.site_name || config.siteName,
+      tagline: s.site_tagline || config.siteTagline,
+      accent: validAccent(s.accent_color) ? s.accent_color.trim() : DEFAULT_ACCENT,
+      theme: s.theme === 'light' ? 'light' : 'dark',
+    };
+  }
+
+  function themeCss() {
+    const ss = siteSettings();
+    let css = `:root { --accent: ${ss.accent}; }\n`;
+    if (ss.theme === 'light') css += LIGHT_PALETTE + '\n';
+    return css;
+  }
+
+  const viewCtx = (req, session) => {
+    const ss = siteSettings();
+    return {
+      siteName: ss.name,
+      siteTagline: ss.tagline,
+      publicUrl: config.publicUrl,
+      user: session?.user ?? null,
+      csrf: session ? csrfFor(config.authSecret, session.token) : '',
+    };
+  };
 
   async function parseForm(req, maxBytes) {
     const ct = String(req.headers['content-type'] || '');
@@ -335,11 +371,12 @@ export async function startServer(overrides = {}) {
 
   async function hHub(req, res, m) {
     const hub = store.getUserBySlug(m[1].toLowerCase());
-    if (!hub || hub.status !== 'approved') {
-      return html(req, res, 404, views.errorPage(viewCtx(req, getSession(req)), 404, 'Hub not found'));
-    }
     const session = getSession(req);
-    const canInteract = Boolean(session && session.user.status === 'approved');
+    const memberView = Boolean(session && session.user.status === 'approved');
+    if (!hub || hub.status !== 'approved' || (!hub.hub_public && !memberView)) {
+      return html(req, res, 404, views.errorPage(viewCtx(req, session), 404, 'Hub not found'));
+    }
+    const canInteract = memberView;
     const posts = decoratePosts(store.listPostsByUser(hub.id), session);
     html(req, res, 200, views.hubPage({
       ...viewCtx(req, session),
@@ -365,7 +402,9 @@ export async function startServer(overrides = {}) {
   async function hHubRss(req, res, m) {
     if (!mediaLimiter(clientIp(req))) return deny(req, res, 'Slow down', 429);
     const hub = store.getUserBySlug(m[1].toLowerCase());
-    if (!hub || hub.status !== 'approved') return deny(req, res, 'Not found', 404);
+    const session = getSession(req);
+    const memberView = Boolean(session && session.user.status === 'approved');
+    if (!hub || hub.status !== 'approved' || (!hub.hub_public && !memberView)) return deny(req, res, 'Not found', 404);
     send(req, res, 200, hubRss(hub), {
       'content-type': 'application/rss+xml; charset=utf-8',
       'cache-control': 'public, max-age=60',
@@ -438,6 +477,7 @@ export async function startServer(overrides = {}) {
       return redirect(req, res, '/hub/edit?error=' + encodeURIComponent('Avatar must be an http(s) URL.'));
     }
     store.updateHubProfile(session.user.id, { name, bio, avatar });
+    store.setHubPublic(session.user.id, form.fields.hub_public === '1');
     redirect(req, res, '/hub/edit?msg=' + encodeURIComponent('Hub saved'));
   }
 
@@ -649,6 +689,7 @@ export async function startServer(overrides = {}) {
     if (!session) return;
     html(req, res, 200, views.adminPage({
       ...viewCtx(req, session),
+      site: siteSettings(),
       pending: store.listPending(),
       users: store.listUsers(),
       writings: store.listWritings(),
@@ -729,6 +770,71 @@ export async function startServer(overrides = {}) {
     redirect(req, res, '/admin?msg=' + encodeURIComponent('Photo deleted'));
   }
 
+  // ---------- privacy + customization ----------
+
+  async function hThemeCss(req, res) {
+    send(req, res, 200, themeCss(), {
+      'content-type': 'text/css; charset=utf-8',
+      'cache-control': 'public, max-age=60',
+    });
+  }
+
+  async function hPrivacy(req, res) {
+    html(req, res, 200, views.privacyPage(viewCtx(req, getSession(req))));
+  }
+
+  async function hMe(req, res) {
+    const session = requireSession(req, res);
+    if (!session) return;
+    html(req, res, 200, views.mePage({
+      ...viewCtx(req, session),
+      stats: {
+        posts: store.listPostsByUser(session.user.id).length,
+        links: store.listLinks(session.user.id).length,
+        following: store.followingIds(session.user.id).length,
+        followers: store.followerCount(session.user.id),
+      },
+    }));
+  }
+
+  async function hMeExport(req, res) {
+    const session = requireSession(req, res);
+    if (!session) return;
+    const data = store.exportUser(session.user.id);
+    send(req, res, 200, JSON.stringify(data, null, 2), {
+      'content-type': 'application/json; charset=utf-8',
+      'content-disposition': `attachment; filename="my-data-${session.user.id}.json"`,
+      'cache-control': 'no-store',
+    });
+  }
+
+  async function hMeDelete(req, res, _m, _url, form) {
+    const session = requireSession(req, res);
+    if (!session) return;
+    if (!postLimiter(clientIp(req)) || !checkCsrf(req, session, form.fields)) return deny(req, res);
+    if (session.user.role === 'owner') return deny(req, res, 'The owner account cannot be deleted here');
+    const id = session.user.id;
+    store.deleteUserCascade(id);
+    clearSessionCookie(req, res);
+    console.log(`[privacy] user #${id} deleted their account`);
+    redirect(req, res, '/?msg=' + encodeURIComponent('Your account and data were deleted.'));
+  }
+
+  async function hAdminSite(req, res, _m, _url, form) {
+    const session = requireOwner(req, res);
+    if (!session) return;
+    if (!postLimiter(clientIp(req)) || !checkCsrf(req, session, form.fields)) return deny(req, res);
+    const name = String(form.fields.site_name || '').trim().slice(0, 80);
+    const tagline = String(form.fields.site_tagline || '').trim().slice(0, 200);
+    const accent = String(form.fields.accent_color || '').trim();
+    const theme = form.fields.theme === 'light' ? 'light' : 'dark';
+    if (name) store.setSiteSetting('site_name', name);
+    store.setSiteSetting('site_tagline', tagline);
+    if (validAccent(accent)) store.setSiteSetting('accent_color', accent.toLowerCase());
+    store.setSiteSetting('theme', theme);
+    redirect(req, res, '/admin?msg=' + encodeURIComponent('Site settings saved'));
+  }
+
   // ---------- router ----------
 
   const routes = [
@@ -743,6 +849,11 @@ export async function startServer(overrides = {}) {
     ['GET', /^\/u\/([a-z0-9-]+)$/, hHub],
     ['GET', /^\/u\/([a-z0-9-]+)\/feed\.xml$/, hHubRss],
     ['GET', /^\/rss\.xml$/, hAllRss],
+    ['GET', /^\/theme\.css$/, hThemeCss],
+    ['GET', /^\/privacy$/, hPrivacy],
+    ['GET', /^\/me$/, hMe],
+    ['GET', /^\/me\/export$/, hMeExport],
+    ['POST', /^\/me\/delete$/, hMeDelete],
     ['GET', /^\/onboarding$/, hOnboarding],
     ['POST', /^\/onboarding$/, hOnboardingPost],
     ['GET', /^\/hub\/edit$/, hHubEdit],
@@ -765,6 +876,7 @@ export async function startServer(overrides = {}) {
     ['GET', /^\/media\/post\/([^/]+)$/, hMediaPost],
     ['GET', /^\/media\/([^/]+)$/, hMedia],
     ['GET', /^\/admin$/, hAdmin],
+    ['POST', /^\/admin\/site$/, hAdminSite],
     ['POST', /^\/admin\/users\/(\d+)\/decide$/, hDecideUser],
     ['POST', /^\/admin\/writings\/new$/, hNewWriting],
     ['POST', /^\/admin\/writings\/(\d+)\/delete$/, hDeleteWriting],
