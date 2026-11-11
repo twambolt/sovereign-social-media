@@ -1,0 +1,14 @@
+{
+  "name": "sovereign-social-media",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A personal, approval-gated website for sharing photos and writings. Sign in with Instagram or Substack; the owner approves each request.",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "smoke": "node scripts/smoke.mjs"
+  }
+}
