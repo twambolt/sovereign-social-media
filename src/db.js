@@ -88,8 +88,12 @@ export function openDb(dataDir) {
       created_at TEXT NOT NULL,
       PRIMARY KEY (follower_id, followee_id)
     );
+    CREATE TABLE IF NOT EXISTS site_settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
   `);
-  for (const col of ['hub_slug TEXT UNIQUE', "bio TEXT NOT NULL DEFAULT ''", "settings_json TEXT NOT NULL DEFAULT '{}'"]) {
+  for (const col of ['hub_slug TEXT UNIQUE', "bio TEXT NOT NULL DEFAULT ''", "settings_json TEXT NOT NULL DEFAULT '{}'", 'hub_public INTEGER NOT NULL DEFAULT 1']) {
     try { db.exec(`ALTER TABLE users ADD COLUMN ${col}`); } catch { /* already exists */ }
   }
   return db;
@@ -156,6 +160,12 @@ export function createStore(db) {
     isFollowing: db.prepare('SELECT 1 FROM follows WHERE follower_id = ? AND followee_id = ?'),
     followingIds: db.prepare('SELECT followee_id FROM follows WHERE follower_id = ?'),
     followerCount: db.prepare('SELECT COUNT(*) AS n FROM follows WHERE followee_id = ?'),
+    likesByUser: db.prepare('SELECT post_id FROM likes WHERE user_id = ?'),
+    followersOfUser: db.prepare('SELECT follower_id FROM follows WHERE followee_id = ?'),
+    allSiteSettings: db.prepare('SELECT key, value FROM site_settings'),
+    setSiteSettingStmt: db.prepare('INSERT INTO site_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value'),
+    setHubPublic: db.prepare('UPDATE users SET hub_public = ? WHERE id = ?'),
+    deleteUserStmt: db.prepare('DELETE FROM users WHERE id = ?'),
   };
   const now = () => new Date().toISOString();
   return {
@@ -240,5 +250,26 @@ export function createStore(db) {
     isFollowing: (followerId, followeeId) => !!q.isFollowing.get(followerId, followeeId),
     followingIds: (followerId) => q.followingIds.all(followerId).map((r) => r.followee_id),
     followerCount: (userId) => q.followerCount.get(userId).n,
+    listSiteSettings: () => q.allSiteSettings.all(),
+    setSiteSetting: (key, value) => q.setSiteSettingStmt.run(key, String(value)),
+    setHubPublic: (userId, pub) => q.setHubPublic.run(pub ? 1 : 0, userId),
+    deleteUserCascade: (userId) => q.deleteUserStmt.run(userId),
+    exportUser: (userId) => {
+      const user = q.userById.get(userId);
+      if (!user) return null;
+      return {
+        user: {
+          id: user.id, provider: user.provider, sub: user.sub, handle: user.handle,
+          name: user.name, email: user.email, status: user.status, role: user.role,
+          hub_slug: user.hub_slug, bio: user.bio, hub_public: !!user.hub_public,
+          created_at: user.created_at, feed_settings: user.settings_json,
+        },
+        hub_links: q.listLinks.all(userId),
+        posts: q.listPostsByUser.all(userId),
+        likes: q.likesByUser.all(userId).map((r) => r.post_id),
+        following: q.followingIds.all(userId).map((r) => r.followee_id),
+        followers: q.followersOfUser.all(userId).map((r) => r.follower_id),
+      };
+    },
   };
 }
