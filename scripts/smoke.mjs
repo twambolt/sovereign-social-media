@@ -128,7 +128,7 @@ try {
   check('owner sees admin with pending alice', r.status === 200 && adminHtml.includes('alice') && adminHtml.includes('Pending requests'));
 
   // 5. Owner approves alice
-  const csrfOwner = csrfOf(adminHtml);
+  let csrfOwner = csrfOf(adminHtml);
   check('csrf token present on admin page', Boolean(csrfOwner));
   const aliceId = adminHtml.match(/action="\/admin\/users\/(\d+)\/decide"/)?.[1];
   check('alice user id found in admin', Boolean(aliceId));
@@ -199,6 +199,194 @@ try {
   // 11. healthz
   r = await anon.fetch('/healthz');
   check('healthz ok', r.status === 200);
+
+  // 12. Hub platform: onboarding, link tree, posts, RSS, subscriptions, feed algorithm
+  const postIdFor = (html, text) =>
+    html.split('<article').find((s) => s.includes(text))?.match(/id="post-(\d+)"/)?.[1];
+
+  // re-login alice (previous step logged her out)
+  r = await member.fetch('/login/mock?as=alice');
+  r = await follow(member, r);
+  check('alice re-login lands on /home', r.status === 200 && (await r.text()).includes('Hello'));
+
+  // owner onboarding -> hub
+  r = await owner.fetch('/onboarding');
+  check('owner onboarding form 200', r.status === 200, `status=${r.status}`);
+  csrfOwner = csrfOf(await r.text());
+  r = await owner.fetch('/onboarding', { method: 'POST', body: `slug=owner-hub&name=Owner&bio=My public hub&csrf=${encodeURIComponent(csrfOwner)}` });
+  check('onboarding creates hub', r.status === 303 && (r.headers.get('location') || '').startsWith('/hub/edit'), `status=${r.status} loc=${r.headers.get('location')}`);
+
+  // public hub page (anonymous)
+  r = await anon.fetch('/u/owner-hub');
+  body = await r.text();
+  check('public hub page 200 for anon', r.status === 200 && body.includes('My public hub') && body.includes('@owner-hub'));
+  check('hub page advertises rss', body.includes('application/rss+xml'));
+
+  // link tree: add good link, reject javascript: link
+  r = await owner.fetch('/hub/edit');
+  csrfOwner = csrfOf(await r.text());
+  r = await owner.fetch('/hub/links/new', { method: 'POST', body: `title=My Blog&url=${encodeURIComponent('https://blog.example.com')}&csrf=${encodeURIComponent(csrfOwner)}` });
+  check('link added', r.status === 303);
+  r = await owner.fetch('/hub/links/new', { method: 'POST', body: `title=evil&url=${encodeURIComponent('javascript:alert(1)')}&csrf=${encodeURIComponent(csrfOwner)}` });
+  check('javascript: url rejected', r.status === 303 && (r.headers.get('location') || '').includes('error='));
+  r = await anon.fetch('/u/owner-hub');
+  body = await r.text();
+  check('hub renders link tree', body.includes('My Blog') && body.includes('https://blog.example.com'));
+  check('no javascript: url rendered', !body.includes('javascript:'));
+
+  // owner posts: beta (older) then alpha (newer), then one with an image
+  r = await owner.fetch('/feed');
+  csrfOwner = csrfOf(await r.text());
+  r = await owner.fetch('/posts/new', { method: 'POST', body: `body=${encodeURIComponent('beta post about news')}&tags=news&csrf=${encodeURIComponent(csrfOwner)}` });
+  check('post beta created', r.status === 303, `status=${r.status}`);
+  r = await owner.fetch('/posts/new', { method: 'POST', body: `body=${encodeURIComponent('alpha post about tech')}&tags=tech&csrf=${encodeURIComponent(csrfOwner)}` });
+  check('post alpha created', r.status === 303);
+  const mpPost = multipart({ csrf: csrfOwner, body: 'photo post', tags: 'photos' }, { image: { filename: 'p.png', contentType: 'image/png', data: PNG_1PX } });
+  r = await owner.fetch('/posts/new', { method: 'POST', headers: { 'content-type': mpPost.contentType }, body: mpPost.body });
+  check('image post created', r.status === 303, `status=${r.status}`);
+
+  // RSS: hub feed + global feed, public
+  r = await anon.fetch('/u/owner-hub/feed.xml');
+  body = await r.text();
+  check('hub rss 200 xml', r.status === 200 && (r.headers.get('content-type') || '').includes('rss+xml'));
+  check('hub rss contains posts', body.includes('beta post about news') && body.includes('alpha post about tech'));
+  r = await anon.fetch('/rss.xml');
+  body = await r.text();
+  check('global rss contains posts', r.status === 200 && body.includes('alpha post about tech'));
+
+  // post image served publicly
+  r = await anon.fetch('/u/owner-hub');
+  body = await r.text();
+  const postImg = body.match(/\/media\/post\/([A-Za-z0-9._-]+)/)?.[1];
+  check('hub shows post image', Boolean(postImg));
+  if (postImg) {
+    r = await anon.fetch(`/media/post/${postImg}`);
+    check('post image public 200 image/png', r.status === 200 && r.headers.get('content-type') === 'image/png', `status=${r.status}`);
+  }
+
+  // alice onboarding + subscribe to owner hub
+  r = await member.fetch('/onboarding');
+  const csrfA = csrfOf(await r.text());
+  check('alice onboarding 200', r.status === 200);
+  r = await member.fetch('/onboarding', { method: 'POST', body: `slug=alice-hub&name=Alice&bio=hi&csrf=${encodeURIComponent(csrfA)}` });
+  check('alice hub created', r.status === 303);
+  r = await member.fetch('/subscriptions');
+  body = await r.text();
+  check('subscriptions lists owner hub', body.includes('owner-hub'));
+  const ownerId = body.match(/action="\/subscriptions\/(\d+)\/follow"/)?.[1];
+  check('owner id found', Boolean(ownerId));
+  r = await member.fetch(`/subscriptions/${ownerId}/follow`, { method: 'POST', body: `csrf=${encodeURIComponent(csrfOf(body))}` });
+  check('alice follows owner', r.status === 303);
+
+  // feed shows subscribed posts
+  r = await member.fetch('/feed');
+  body = await r.text();
+  check('feed shows subscribed posts', body.includes('beta post about news') && body.includes('alpha post about tech'));
+
+  // tailor algorithm: interest weight only, interests=news -> beta first
+  r = await member.fetch('/feed/settings');
+  const csrfF = csrfOf(await r.text());
+  r = await member.fetch('/feed/settings', { method: 'POST', body: `mode=algorithm&w_freshness=0&w_engagement=0&w_interest=1&interests=news&csrf=${encodeURIComponent(csrfF)}` });
+  check('feed settings saved', r.status === 303);
+  r = await member.fetch('/feed');
+  body = await r.text();
+  check('interest tailoring reorders feed', body.indexOf('beta post about news') !== -1 && body.indexOf('beta post about news') < body.indexOf('alpha post about tech'));
+
+  // chrono mode -> alpha (newer) first
+  r = await member.fetch('/feed/settings', { method: 'POST', body: `mode=chrono&w_freshness=1&w_engagement=0.6&w_interest=0.8&interests=&csrf=${encodeURIComponent(csrfF)}` });
+  check('chrono settings saved', r.status === 303);
+  r = await member.fetch('/feed');
+  body = await r.text();
+  check('chrono mode newest first', body.indexOf('alpha post about tech') !== -1 && body.indexOf('alpha post about tech') < body.indexOf('beta post about news'));
+
+  // like beta; engagement-only ranking -> beta first
+  const betaId = postIdFor(body, 'beta post about news');
+  check('beta post id found', Boolean(betaId));
+  r = await member.fetch(`/posts/${betaId}/like`, { method: 'POST', body: `csrf=${encodeURIComponent(csrfF)}` });
+  check('like toggles', r.status === 303, `status=${r.status}`);
+  r = await member.fetch('/feed/settings', { method: 'POST', body: `mode=algorithm&w_freshness=0&w_engagement=1&w_interest=0&interests=&csrf=${encodeURIComponent(csrfF)}` });
+  r = await member.fetch('/feed');
+  body = await r.text();
+  check('engagement weight reorders feed', body.indexOf('beta post about news') !== -1 && body.indexOf('beta post about news') < body.indexOf('alpha post about tech'));
+
+  // public hubs directory
+  r = await anon.fetch('/hubs');
+  body = await r.text();
+  check('public hubs directory lists hubs', r.status === 200 && body.includes('owner-hub') && body.includes('alice-hub'));
+
+  // negatives
+  r = await anon.fetch('/feed');
+  check('anon /feed redirects', r.status === 303);
+  r = await anon.fetch('/onboarding');
+  check('anon /onboarding redirects', r.status === 303);
+  r = await anon.fetch('/posts/new', { method: 'POST', body: 'body=x&csrf=x' });
+  check('anon post rejected', r.status === 303);
+  const mallory = jar();
+  r = await mallory.fetch('/login/mock?as=mallory');
+  r = await follow(mallory, r);
+  r = await mallory.fetch('/feed');
+  check('pending user feed -> /gate', r.status === 303 && r.headers.get('location') === '/gate');
+  r = await owner.fetch('/onboarding');
+  check('onboarding redirects when hub exists', r.status === 303 && r.headers.get('location') === '/hub/edit');
+
+  // 13. Privacy + no-code customization
+  r = await anon.fetch('/privacy');
+  check('privacy page public 200', r.status === 200 && (await r.text()).includes('No analytics'));
+  r = await anon.fetch('/theme.css');
+  body = await r.text();
+  check('theme.css default accent', r.status === 200 && (r.headers.get('content-type') || '').includes('text/css') && body.includes('--accent: #e8c07d'));
+
+  // owner rebrands the site from /admin (no code)
+  r = await owner.fetch('/admin');
+  csrfOwner = csrfOf(await r.text());
+  r = await owner.fetch('/admin/site', { method: 'POST', body: `site_name=Renamed Site&site_tagline=New tagline&accent_color=%23ff0000&theme=light&csrf=${encodeURIComponent(csrfOwner)}` });
+  check('admin site settings saved', r.status === 303, `status=${r.status}`);
+  r = await anon.fetch('/');
+  body = await r.text();
+  check('landing shows new site name', body.includes('Renamed Site') && body.includes('New tagline'));
+  r = await anon.fetch('/theme.css');
+  body = await r.text();
+  check('theme.css has new accent + light palette', body.includes('--accent: #ff0000') && body.includes('--bg: #f6f5f2'));
+  // restore dark/defaults for the rest of the test
+  r = await owner.fetch('/admin/site', { method: 'POST', body: `site_name=Test Site&site_tagline=Smoke test tagline&accent_color=%23e8c07d&theme=dark&csrf=${encodeURIComponent(csrfOwner)}` });
+  check('site settings restored', r.status === 303);
+
+  // members-only hub toggle
+  r = await owner.fetch('/hub/edit');
+  csrfOwner = csrfOf(await r.text());
+  r = await owner.fetch('/hub/edit', { method: 'POST', body: `name=Owner&bio=My public hub&avatar=&csrf=${encodeURIComponent(csrfOwner)}` });
+  check('hub set members-only', r.status === 303);
+  r = await anon.fetch('/u/owner-hub');
+  check('anon cannot see members-only hub', r.status === 404, `status=${r.status}`);
+  r = await anon.fetch('/u/owner-hub/feed.xml');
+  check('anon cannot read members-only rss', r.status === 404, `status=${r.status}`);
+  r = await member.fetch('/u/owner-hub');
+  check('approved member sees members-only hub', r.status === 200);
+  r = await owner.fetch('/hub/edit', { method: 'POST', body: `name=Owner&bio=My public hub&avatar=&hub_public=1&csrf=${encodeURIComponent(csrfOwner)}` });
+  r = await anon.fetch('/u/owner-hub');
+  check('hub public again', r.status === 200);
+
+  // account page + data export
+  r = await member.fetch('/me');
+  body = await r.text();
+  check('account page 200 with hub', r.status === 200 && body.includes('alice-hub'));
+  r = await member.fetch('/me/export');
+  body = await r.text();
+  check('data export json', r.status === 200 && (r.headers.get('content-type') || '').includes('json') && body.includes('"provider": "mock"') && body.includes('alice-hub'));
+
+  // owner cannot self-delete
+  r = await owner.fetch('/me/delete', { method: 'POST', body: `csrf=${encodeURIComponent(csrfOwner)}` });
+  check('owner self-delete blocked', r.status === 403, `status=${r.status}`);
+
+  // pending user deletes own account, then re-registers as new pending
+  r = await mallory.fetch('/me/delete', { method: 'POST', body: `csrf=${encodeURIComponent(csrfOf(await mallory.fetch('/me').then((x) => x.text())))}` });
+  check('mallory deletes account', r.status === 303, `status=${r.status}`);
+  r = await mallory.fetch('/gate');
+  check('after delete, session gone', r.status === 303 && r.headers.get('location') === '/');
+  r = await mallory.fetch('/login/mock?as=mallory');
+  r = await follow(mallory, r);
+  r = await mallory.fetch('/gate');
+  check('re-register creates fresh pending user', r.status === 200 && (await r.text()).includes('waiting'));
 } finally {
   server.close();
   fs.rmSync(tmp, { recursive: true, force: true });
