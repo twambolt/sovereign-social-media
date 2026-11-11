@@ -7,6 +7,8 @@ import { openDb, createStore } from './db.js';
 import { randomToken, sha256hex, safeEqual, parseCookies, csrfFor, makeRateLimiter, clientIp } from './security.js';
 import { parseMultipart, multipartBoundary } from './multipart.js';
 import { makeProviders } from './providers.js';
+import { scoreFeed, parseSettings, normalizeTags, defaultSettings } from './feed.js';
+import { rssFeed, postToRssItem } from './rss.js';
 import * as views from './views.js';
 
 const MIME_STATIC = {
@@ -26,10 +28,16 @@ const IMAGE_TYPES = {
   '.gif': 'image/gif',
 };
 
+const RESERVED_SLUGS = new Set([
+  'admin', 'u', 'feed', 'rss', 'login', 'logout', 'auth', 'media', 'photos', 'writings',
+  'home', 'gate', 'onboarding', 'hub', 'hubs', 'subscriptions', 'posts', 'healthz',
+  'style.css', 'favicon.svg', 'app.js', 'settings',
+]);
+
 function sniffImage(buf) {
   if (buf.length > 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return '.jpg';
   if (buf.length > 8 && buf.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return '.png';
-  if (buf.length > 6 && buf.toString('latin1', 0, 6) === 'GIF89a' || buf.toString('latin1', 0, 6) === 'GIF87a') return '.gif';
+  if (buf.length > 6 && (buf.toString('latin1', 0, 6) === 'GIF89a' || buf.toString('latin1', 0, 6) === 'GIF87a')) return '.gif';
   if (buf.length > 12 && buf.toString('latin1', 0, 4) === 'RIFF' && buf.toString('latin1', 8, 12) === 'WEBP') return '.webp';
   return null;
 }
@@ -41,6 +49,19 @@ function slugify(title) {
     .replace(/^-+|-+$/g, '')
     .slice(0, 80);
   return s || 'post';
+}
+
+function validHttpUrl(s) {
+  try {
+    const u = new URL(String(s || ''));
+    return u.protocol === 'http:' || u.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+function validSlug(s) {
+  return /^[a-z0-9][a-z0-9-]{1,31}$/.test(String(s || '').toLowerCase()) && !RESERVED_SLUGS.has(String(s).toLowerCase());
 }
 
 function readBody(req, maxBytes) {
@@ -131,6 +152,7 @@ export async function startServer(overrides = {}) {
   const viewCtx = (req, session) => ({
     siteName: config.siteName,
     siteTagline: config.siteTagline,
+    publicUrl: config.publicUrl,
     user: session?.user ?? null,
     csrf: session ? csrfFor(config.authSecret, session.token) : '',
   });
@@ -193,6 +215,13 @@ export async function startServer(overrides = {}) {
     }
     return session;
   }
+
+  const decoratePosts = (posts, session) =>
+    posts.map((p) => ({
+      ...p,
+      likes: store.likeCount(p.id),
+      liked: session ? store.hasLiked(p.id, session.user.id) : false,
+    }));
 
   // ---------- handlers ----------
 
@@ -298,6 +327,267 @@ export async function startServer(overrides = {}) {
     html(req, res, 200, views.homePage({ ...viewCtx(req, session), counts: { photos: store.countPhotos(), writings: store.countWritings() } }));
   }
 
+  // ---------- public hubs + RSS ----------
+
+  async function hHubs(req, res) {
+    html(req, res, 200, views.hubsPage({ ...viewCtx(req, getSession(req)), hubs: store.listHubs() }));
+  }
+
+  async function hHub(req, res, m) {
+    const hub = store.getUserBySlug(m[1].toLowerCase());
+    if (!hub || hub.status !== 'approved') {
+      return html(req, res, 404, views.errorPage(viewCtx(req, getSession(req)), 404, 'Hub not found'));
+    }
+    const session = getSession(req);
+    const canInteract = Boolean(session && session.user.status === 'approved');
+    const posts = decoratePosts(store.listPostsByUser(hub.id), session);
+    html(req, res, 200, views.hubPage({
+      ...viewCtx(req, session),
+      hub,
+      posts,
+      links: store.listLinks(hub.id),
+      following: canInteract ? store.isFollowing(session.user.id, hub.id) : false,
+      followers: store.followerCount(hub.id),
+      canInteract,
+    }));
+  }
+
+  function hubRss(hub) {
+    const posts = store.listPostsByUser(hub.id);
+    return rssFeed({
+      title: `${hub.name || hub.hub_slug} (@${hub.hub_slug})`,
+      link: `${config.publicUrl}/u/${hub.hub_slug}`,
+      description: hub.bio || `Posts from @${hub.hub_slug}`,
+      items: posts.map((p) => postToRssItem(p, config.publicUrl, hub.hub_slug)),
+    });
+  }
+
+  async function hHubRss(req, res, m) {
+    if (!mediaLimiter(clientIp(req))) return deny(req, res, 'Slow down', 429);
+    const hub = store.getUserBySlug(m[1].toLowerCase());
+    if (!hub || hub.status !== 'approved') return deny(req, res, 'Not found', 404);
+    send(req, res, 200, hubRss(hub), {
+      'content-type': 'application/rss+xml; charset=utf-8',
+      'cache-control': 'public, max-age=60',
+    });
+  }
+
+  async function hAllRss(req, res) {
+    if (!mediaLimiter(clientIp(req))) return deny(req, res, 'Slow down', 429);
+    const posts = store.listRecentPosts(50);
+    send(req, res, 200, rssFeed({
+      title: `${config.siteName} — all posts`,
+      link: config.publicUrl,
+      description: `Latest posts across all hubs on ${config.siteName}`,
+      items: posts.map((p) => postToRssItem(p, config.publicUrl, p.hub_slug)),
+    }), {
+      'content-type': 'application/rss+xml; charset=utf-8',
+      'cache-control': 'public, max-age=60',
+    });
+  }
+
+  // ---------- onboarding + hub editing (approved members) ----------
+
+  async function hOnboarding(req, res, _m, url) {
+    const session = requireApproved(req, res);
+    if (!session) return;
+    if (session.user.hub_slug) return redirect(req, res, '/hub/edit');
+    html(req, res, 200, views.onboardingPage(viewCtx(req, session), url.searchParams.get('error') || ''));
+  }
+
+  async function hOnboardingPost(req, res, _m, _url, form) {
+    const session = requireApproved(req, res);
+    if (!session) return;
+    if (!postLimiter(clientIp(req)) || !checkCsrf(req, session, form.fields)) return deny(req, res);
+    if (session.user.hub_slug) return redirect(req, res, '/hub/edit');
+    const slug = String(form.fields.slug || '').trim().toLowerCase();
+    const name = String(form.fields.name || session.user.name || '').trim().slice(0, 80);
+    const bio = String(form.fields.bio || '').trim().slice(0, 300);
+    if (!validSlug(slug)) {
+      return redirect(req, res, '/onboarding?error=' + encodeURIComponent('Handle must be 2-32 chars of lowercase letters, numbers and dashes, and not a reserved word.'));
+    }
+    if (store.getUserBySlug(slug)) {
+      return redirect(req, res, '/onboarding?error=' + encodeURIComponent('That handle is taken — pick another.'));
+    }
+    store.setHub(session.user.id, slug, name, bio);
+    console.log(`[hub] user #${session.user.id} created hub @${slug}`);
+    redirect(req, res, '/hub/edit?msg=' + encodeURIComponent(`Hub @${slug} created — add your link tree`));
+  }
+
+  async function hHubEdit(req, res, _m, url) {
+    const session = requireApproved(req, res);
+    if (!session) return;
+    if (!session.user.hub_slug) return redirect(req, res, '/onboarding');
+    html(req, res, 200, views.hubEditPage({
+      ...viewCtx(req, session),
+      links: store.listLinks(session.user.id),
+      flash: url.searchParams.get('msg') || '',
+      error: url.searchParams.get('error') || '',
+    }));
+  }
+
+  async function hHubEditPost(req, res, _m, _url, form) {
+    const session = requireApproved(req, res);
+    if (!session) return;
+    if (!postLimiter(clientIp(req)) || !checkCsrf(req, session, form.fields)) return deny(req, res);
+    if (!session.user.hub_slug) return redirect(req, res, '/onboarding');
+    const name = String(form.fields.name || '').trim().slice(0, 80);
+    const bio = String(form.fields.bio || '').trim().slice(0, 300);
+    const avatar = String(form.fields.avatar || '').trim().slice(0, 500);
+    if (avatar && !validHttpUrl(avatar)) {
+      return redirect(req, res, '/hub/edit?error=' + encodeURIComponent('Avatar must be an http(s) URL.'));
+    }
+    store.updateHubProfile(session.user.id, { name, bio, avatar });
+    redirect(req, res, '/hub/edit?msg=' + encodeURIComponent('Hub saved'));
+  }
+
+  async function hLinkNew(req, res, _m, _url, form) {
+    const session = requireApproved(req, res);
+    if (!session) return;
+    if (!postLimiter(clientIp(req)) || !checkCsrf(req, session, form.fields)) return deny(req, res);
+    if (!session.user.hub_slug) return redirect(req, res, '/onboarding');
+    const title = String(form.fields.title || '').trim().slice(0, 100);
+    const url = String(form.fields.url || '').trim().slice(0, 500);
+    if (!title || !validHttpUrl(url)) {
+      return redirect(req, res, '/hub/edit?error=' + encodeURIComponent('Link needs a title and an http(s) URL.'));
+    }
+    store.addLink(session.user.id, title, url);
+    redirect(req, res, '/hub/edit?msg=' + encodeURIComponent('Link added'));
+  }
+
+  async function hLinkDelete(req, res, m, _url, form) {
+    const session = requireApproved(req, res);
+    if (!session) return;
+    if (!postLimiter(clientIp(req)) || !checkCsrf(req, session, form.fields)) return deny(req, res);
+    const link = store.getLink(Number(m[1]));
+    if (link && link.user_id === session.user.id) store.deleteLink(link.id);
+    redirect(req, res, '/hub/edit?msg=' + encodeURIComponent('Link removed'));
+  }
+
+  async function hLinkMove(req, res, m, _url, form) {
+    const session = requireApproved(req, res);
+    if (!session) return;
+    if (!postLimiter(clientIp(req)) || !checkCsrf(req, session, form.fields)) return deny(req, res);
+    const dir = Number(form.fields.dir) === 1 ? 1 : -1;
+    store.moveLink(Number(m[1]), session.user.id, dir);
+    redirect(req, res, '/hub/edit');
+  }
+
+  // ---------- subscriptions + feed ----------
+
+  async function hSubscriptions(req, res) {
+    const session = requireApproved(req, res);
+    if (!session) return;
+    html(req, res, 200, views.subscriptionsPage({
+      ...viewCtx(req, session),
+      hubs: store.listHubs(),
+      followingIds: new Set(store.followingIds(session.user.id)),
+    }));
+  }
+
+  async function hFollow(req, res, m, _url, form) {
+    const session = requireApproved(req, res);
+    if (!session) return;
+    if (!postLimiter(clientIp(req)) || !checkCsrf(req, session, form.fields)) return deny(req, res);
+    const target = store.getUserById(Number(m[1]));
+    if (!target || !target.hub_slug || target.status !== 'approved') return deny(req, res, 'No such hub', 404);
+    if (target.id === session.user.id) return deny(req, res, 'Cannot subscribe to yourself', 400);
+    if (m[2] === 'follow') store.follow(session.user.id, target.id);
+    else store.unfollow(session.user.id, target.id);
+    redirect(req, res, '/subscriptions');
+  }
+
+  async function hFeed(req, res) {
+    const session = requireApproved(req, res);
+    if (!session) return;
+    const settings = parseSettings(store.getSettings(session.user.id));
+    const candidates = decoratePosts(store.feedCandidates(session.user.id), session);
+    const posts = scoreFeed(candidates, settings);
+    html(req, res, 200, views.feedPage({
+      ...viewCtx(req, session),
+      posts,
+      followingCount: store.followingIds(session.user.id).length,
+      settings,
+      canInteract: true,
+    }));
+  }
+
+  async function hFeedSettings(req, res, _m, url) {
+    const session = requireApproved(req, res);
+    if (!session) return;
+    html(req, res, 200, views.feedSettingsPage({
+      ...viewCtx(req, session),
+      settings: parseSettings(store.getSettings(session.user.id)),
+      flash: url.searchParams.get('msg') || '',
+    }));
+  }
+
+  async function hFeedSettingsPost(req, res, _m, _url, form) {
+    const session = requireApproved(req, res);
+    if (!session) return;
+    if (!postLimiter(clientIp(req)) || !checkCsrf(req, session, form.fields)) return deny(req, res);
+    const current = parseSettings(store.getSettings(session.user.id));
+    const settings = {
+      mode: form.fields.mode === 'chrono' ? 'chrono' : 'algorithm',
+      weights: {
+        freshness: Number(form.fields.w_freshness ?? current.weights.freshness),
+        engagement: Number(form.fields.w_engagement ?? current.weights.engagement),
+        interest: Number(form.fields.w_interest ?? current.weights.interest),
+      },
+      interests: normalizeTags(form.fields.interests || '').split(',').map((s) => s.trim()).filter(Boolean).slice(0, 20),
+    };
+    store.setSettings(session.user.id, JSON.stringify(settings));
+    redirect(req, res, '/feed/settings?msg=' + encodeURIComponent('Feed algorithm saved'));
+  }
+
+  async function hPostNew(req, res, _m, _url, form) {
+    const session = requireApproved(req, res);
+    if (!session) return;
+    if (!postLimiter(clientIp(req)) || !checkCsrf(req, session, form.fields)) return deny(req, res);
+    const body = String(form.fields.body || '').slice(0, 2000);
+    if (!body.trim()) return redirect(req, res, '/feed?msg=' + encodeURIComponent('Post body is required'));
+    const tags = normalizeTags(form.fields.tags);
+    let image = '';
+    const file = form.files?.image;
+    if (file && file.filename && file.data?.length) {
+      if (file.data.length > config.maxUploadBytes) return redirect(req, res, '/feed?msg=' + encodeURIComponent('Image too large'));
+      const ext = sniffImage(file.data);
+      if (!ext) return redirect(req, res, '/feed?msg=' + encodeURIComponent('Only JPG, PNG, GIF or WebP images are allowed'));
+      image = randomToken(16) + ext;
+      fs.writeFileSync(path.join(config.uploadsDir, image), file.data);
+    }
+    const post = store.addPost(session.user.id, body.trim(), tags, image);
+    console.log(`[post] #${post.id} by user #${session.user.id}`);
+    redirect(req, res, `/u/${encodeURIComponent(session.user.hub_slug || '')}#post-${post.id}`);
+  }
+
+  async function hPostLike(req, res, m, _url, form) {
+    const session = requireApproved(req, res);
+    if (!session) return;
+    if (!postLimiter(clientIp(req)) || !checkCsrf(req, session, form.fields)) return deny(req, res);
+    const post = store.getPost(Number(m[1]));
+    if (!post) return deny(req, res, 'No such post', 404);
+    store.toggleLike(post.id, session.user.id);
+    redirect(req, res, req.headers.referer && req.headers.referer.startsWith(config.publicUrl) ? req.headers.referer : '/feed');
+  }
+
+  async function hPostDelete(req, res, m, _url, form) {
+    const session = requireApproved(req, res);
+    if (!session) return;
+    if (!postLimiter(clientIp(req)) || !checkCsrf(req, session, form.fields)) return deny(req, res);
+    const post = store.getPost(Number(m[1]));
+    if (!post) return deny(req, res, 'No such post', 404);
+    if (post.user_id !== session.user.id && session.user.role !== 'owner') return deny(req, res, 'Not allowed');
+    if (post.image) {
+      const f = path.join(config.uploadsDir, post.image);
+      if (fs.existsSync(f)) fs.unlinkSync(f);
+    }
+    store.deletePost(post.id);
+    redirect(req, res, '/feed?msg=' + encodeURIComponent('Post deleted'));
+  }
+
+  // ---------- gated gallery (owner-managed) ----------
+
   async function hPhotos(req, res) {
     const session = requireApproved(req, res);
     if (!session) return;
@@ -330,7 +620,15 @@ export async function startServer(overrides = {}) {
     if (!mediaLimiter(clientIp(req))) return deny(req, res, 'Slow down', 429);
     const session = requireApproved(req, res);
     if (!session) return;
-    const name = m[1];
+    return serveUpload(req, res, m[1], false);
+  }
+
+  async function hMediaPost(req, res, m) {
+    if (!mediaLimiter(clientIp(req))) return deny(req, res, 'Slow down', 429);
+    return serveUpload(req, res, m[1], true);
+  }
+
+  function serveUpload(req, res, name, publicRoute) {
     if (!/^[A-Za-z0-9._-]+$/.test(name) || name.startsWith('.')) return deny(req, res, 'Bad file name', 400);
     const file = path.join(config.uploadsDir, name);
     if (!file.startsWith(config.uploadsDir + path.sep)) return deny(req, res, 'Bad file name', 400);
@@ -339,10 +637,12 @@ export async function startServer(overrides = {}) {
     const type = IMAGE_TYPES[ext] || 'application/octet-stream';
     send(req, res, 200, fs.readFileSync(file), {
       'content-type': type,
-      'cache-control': 'private, max-age=300',
+      'cache-control': publicRoute ? 'public, max-age=3600' : 'private, max-age=300',
       'content-disposition': 'inline',
     });
   }
+
+  // ---------- admin ----------
 
   async function hAdmin(req, res, _m, url) {
     const session = requireOwner(req, res);
@@ -439,10 +739,30 @@ export async function startServer(overrides = {}) {
     ['POST', /^\/logout$/, hLogout],
     ['GET', /^\/gate$/, hGate],
     ['GET', /^\/home$/, hHome],
+    ['GET', /^\/hubs$/, hHubs],
+    ['GET', /^\/u\/([a-z0-9-]+)$/, hHub],
+    ['GET', /^\/u\/([a-z0-9-]+)\/feed\.xml$/, hHubRss],
+    ['GET', /^\/rss\.xml$/, hAllRss],
+    ['GET', /^\/onboarding$/, hOnboarding],
+    ['POST', /^\/onboarding$/, hOnboardingPost],
+    ['GET', /^\/hub\/edit$/, hHubEdit],
+    ['POST', /^\/hub\/edit$/, hHubEditPost],
+    ['POST', /^\/hub\/links\/new$/, hLinkNew],
+    ['POST', /^\/hub\/links\/(\d+)\/delete$/, hLinkDelete],
+    ['POST', /^\/hub\/links\/(\d+)\/move$/, hLinkMove],
+    ['GET', /^\/subscriptions$/, hSubscriptions],
+    ['POST', /^\/subscriptions\/(\d+)\/(follow|unfollow)$/, hFollow],
+    ['GET', /^\/feed$/, hFeed],
+    ['GET', /^\/feed\/settings$/, hFeedSettings],
+    ['POST', /^\/feed\/settings$/, hFeedSettingsPost],
+    ['POST', /^\/posts\/new$/, hPostNew],
+    ['POST', /^\/posts\/(\d+)\/like$/, hPostLike],
+    ['POST', /^\/posts\/(\d+)\/delete$/, hPostDelete],
     ['GET', /^\/photos$/, hPhotos],
     ['GET', /^\/photos\/(\d+)$/, hPhoto],
     ['GET', /^\/writings$/, hWritings],
     ['GET', /^\/writings\/([a-z0-9-]+)$/, hWriting],
+    ['GET', /^\/media\/post\/([^/]+)$/, hMediaPost],
     ['GET', /^\/media\/([^/]+)$/, hMedia],
     ['GET', /^\/admin$/, hAdmin],
     ['POST', /^\/admin\/users\/(\d+)\/decide$/, hDecideUser],
@@ -474,7 +794,7 @@ export async function startServer(overrides = {}) {
         if (!m) continue;
         let form = null;
         if (req.method === 'POST') {
-          const maxBytes = pathname === '/admin/photos/new' ? config.maxUploadBytes + 1024 * 1024 : 1024 * 1024;
+          const maxBytes = pathname === '/admin/photos/new' || pathname === '/posts/new' ? config.maxUploadBytes + 1024 * 1024 : 1024 * 1024;
           try {
             form = await parseForm(req, maxBytes);
           } catch (e) {
